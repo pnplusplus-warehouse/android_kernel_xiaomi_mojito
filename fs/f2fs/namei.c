@@ -23,7 +23,7 @@
 #include <trace/events/f2fs.h>
 
 static inline bool is_extension_exist(const unsigned char *s, const char *sub,
-						bool tmp_ext, bool tmp_dot)
+						bool tmp_ext)
 {
 	size_t slen = strlen(s);
 	size_t sublen = strlen(sub);
@@ -49,25 +49,11 @@ static inline bool is_extension_exist(const unsigned char *s, const char *sub,
 	for (i = 1; i < slen - sublen; i++) {
 		if (s[i] != '.')
 			continue;
-		if (!strncasecmp(s + i + 1, sub, sublen)) {
-			if (!tmp_dot)
-				return true;
-			if (i == slen - sublen - 1 || s[i + 1 + sublen] == '.')
-				return true;
-		}
+		if (!strncasecmp(s + i + 1, sub, sublen))
+			return true;
 	}
 
 	return false;
-}
-
-static inline bool is_temperature_extension(const unsigned char *s, const char *sub)
-{
-	return is_extension_exist(s, sub, true, false);
-}
-
-static inline bool is_compress_extension(const unsigned char *s, const char *sub)
-{
-	return is_extension_exist(s, sub, true, true);
 }
 
 int f2fs_update_extension_list(struct f2fs_sb_info *sbi, const char *name,
@@ -162,7 +148,7 @@ static void set_compress_new_inode(struct f2fs_sb_info *sbi, struct inode *dir,
 	cold_count = le32_to_cpu(sbi->raw_super->extension_count);
 	hot_count = sbi->raw_super->hot_ext_count;
 	for (i = cold_count; i < cold_count + hot_count; i++)
-		if (is_temperature_extension(name, extlist[i]))
+		if (is_extension_exist(name, extlist[i], false))
 			break;
 	f2fs_up_read(&sbi->sb_lock);
 	if (i < (cold_count + hot_count))
@@ -170,12 +156,12 @@ static void set_compress_new_inode(struct f2fs_sb_info *sbi, struct inode *dir,
 
 	/* Don't compress unallowed extension. */
 	for (i = 0; i < noext_cnt; i++)
-		if (is_compress_extension(name, noext[i]))
+		if (is_extension_exist(name, noext[i], false))
 			return;
 
 	/* Compress wanting extension. */
 	for (i = 0; i < ext_cnt; i++) {
-		if (is_compress_extension(name, ext[i])) {
+		if (is_extension_exist(name, ext[i], false)) {
 			set_compress_context(inode);
 			return;
 		}
@@ -203,7 +189,7 @@ static void set_file_temperature(struct f2fs_sb_info *sbi, struct inode *inode,
 	cold_count = le32_to_cpu(sbi->raw_super->extension_count);
 	hot_count = sbi->raw_super->hot_ext_count;
 	for (i = 0; i < cold_count + hot_count; i++)
-		if (is_temperature_extension(name, extlist[i]))
+		if (is_extension_exist(name, extlist[i], true))
 			break;
 	f2fs_up_read(&sbi->sb_lock);
 
@@ -454,6 +440,7 @@ static int __recover_dot_dentries(struct inode *dir, nid_t pino)
 {
 	struct f2fs_sb_info *sbi = F2FS_I_SB(dir);
 	struct qstr dot = QSTR_INIT(".", 1);
+	struct qstr dotdot = QSTR_INIT("..", 2);
 	struct f2fs_dir_entry *de;
 	struct page *page;
 	int err = 0;
@@ -486,8 +473,18 @@ static int __recover_dot_dentries(struct inode *dir, nid_t pino)
 		err = PTR_ERR(page);
 		goto out;
 	} else {
-		err = f2fs_do_add_link(dir, &dot, NULL, pino, S_IFDIR);
+		err = f2fs_do_add_link(dir, &dot, NULL, dir->i_ino, S_IFDIR);
+		if (err)
+			goto out;
 	}
+
+	de = f2fs_find_entry(dir, &dotdot, &page);
+	if (de)
+		f2fs_put_page(page, 0);
+	else if (IS_ERR(page))
+		err = PTR_ERR(page);
+	else
+		err = f2fs_do_add_link(dir, &dotdot, NULL, pino, S_IFDIR);
 out:
 	if (!err)
 		clear_inode_flag(dir, FI_INLINE_DOTS);
@@ -574,8 +571,8 @@ out_splice:
 	}
 #endif
 	new = d_splice_alias(inode, dentry);
-	trace_f2fs_lookup_end(dir, !IS_ERR_OR_NULL(new) ? new : dentry,
-				ino, IS_ERR(new) ? PTR_ERR(new) : err);
+	err = PTR_ERR_OR_ZERO(new);
+	trace_f2fs_lookup_end(dir, dentry, ino, !new ? -ENOENT : err);
 	return new;
 out_iput:
 	iput(inode);
@@ -941,7 +938,6 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	struct f2fs_dir_entry *old_dir_entry = NULL;
 	struct f2fs_dir_entry *old_entry;
 	struct f2fs_dir_entry *new_entry;
-	bool old_is_dir = S_ISDIR(old_inode->i_mode);
 	int err;
 
 	if (unlikely(f2fs_cp_error(sbi)))
@@ -1004,7 +1000,7 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 		goto out_unlock_old;
 	}
 
-	if (old_is_dir && old_dir != new_dir) {
+	if (S_ISDIR(old_inode->i_mode)) {
 		old_dir_entry = f2fs_parent_dir(old_inode, &old_dir_page);
 		if (!old_dir_entry) {
 			if (IS_ERR(old_dir_page))
@@ -1016,7 +1012,7 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 	if (new_inode) {
 
 		err = -ENOTEMPTY;
-		if (old_is_dir && !f2fs_empty_dir(new_inode))
+		if (old_dir_entry && !f2fs_empty_dir(new_inode))
 			goto out_dir;
 
 		err = -ENOENT;
@@ -1041,7 +1037,7 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 
 		new_inode->i_ctime = current_time(new_inode);
 		f2fs_down_write(&F2FS_I(new_inode)->i_sem);
-		if (old_is_dir)
+		if (old_dir_entry)
 			f2fs_i_links_write(new_inode, false);
 		f2fs_i_links_write(new_inode, false);
 		f2fs_up_write(&F2FS_I(new_inode)->i_sem);
@@ -1061,12 +1057,12 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 			goto out_dir;
 		}
 
-		if (old_is_dir)
+		if (old_dir_entry)
 			f2fs_i_links_write(new_dir, true);
 	}
 
 	f2fs_down_write(&F2FS_I(old_inode)->i_sem);
-	if (!old_is_dir || whiteout)
+	if (!old_dir_entry || whiteout)
 		file_lost_pino(old_inode);
 	else
 		/* adjust dir's i_pino to pass fsck check */
@@ -1092,11 +1088,14 @@ static int f2fs_rename(struct inode *old_dir, struct dentry *old_dentry,
 		iput(whiteout);
 	}
 
-	if (old_dir_entry)
-		f2fs_set_link(old_inode, old_dir_entry, old_dir_page, new_dir);
-	if (old_is_dir)
+	if (old_dir_entry) {
+		if (old_dir != new_dir)
+			f2fs_set_link(old_inode, old_dir_entry,
+						old_dir_page, new_dir);
+		else
+			f2fs_put_page(old_dir_page, 0);
 		f2fs_i_links_write(old_dir, false);
-
+	}
 	if (F2FS_OPTION(sbi).fsync_mode == FSYNC_MODE_STRICT) {
 		f2fs_add_ino_entry(sbi, new_dir->i_ino, TRANS_DIR_INO);
 		if (S_ISDIR(old_inode->i_mode))
@@ -1305,27 +1304,20 @@ static int f2fs_rename2(struct inode *old_dir, struct dentry *old_dentry,
 	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT))
 		return -EINVAL;
 
-	trace_f2fs_rename_start(old_dir, old_dentry, new_dir, new_dentry,
-								flags);
-
 	err = fscrypt_prepare_rename(old_dir, old_dentry, new_dir, new_dentry,
 				     flags);
 	if (err)
 		return err;
 
-	if (flags & RENAME_EXCHANGE)
-		err = f2fs_cross_rename(old_dir, old_dentry,
-					new_dir, new_dentry);
-	else
+	if (flags & RENAME_EXCHANGE) {
+		return f2fs_cross_rename(old_dir, old_dentry,
+					 new_dir, new_dentry);
+	}
 	/*
 	 * VFS has already handled the new dentry existence case,
 	 * here, we just deal with "RENAME_NOREPLACE" as regular rename.
 	 */
-		err = f2fs_rename(old_dir, old_dentry,
-					new_dir, new_dentry, flags);
-
-	trace_f2fs_rename_end(old_dentry, new_dentry, flags, err);
-	return err;
+	return f2fs_rename(old_dir, old_dentry, new_dir, new_dentry, flags);
 }
 
 static const char *f2fs_encrypted_get_link(struct dentry *dentry,
